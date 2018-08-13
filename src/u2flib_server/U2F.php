@@ -111,16 +111,18 @@ class U2F
      * @param array $registrations List of current registrations for this
      * user, to prevent the user from registering the same authenticator several
      * times.
-     * @return array An array of two elements, the first containing a
-     * RegisterRequest the second being an array of SignRequest
+     * @return array An array of three elements :
+     *     string An application id for the request
+     *     object Register request with application id and a challenge string
+     *     array Identifiers for already registered tokens
+     *
      * @throws Error
      */
     public function getRegisterData(array $registrations = array())
     {
-        $challenge = $this->createChallenge();
-        $request = new RegisterRequest($challenge, $this->appId);
-        $signs = $this->getAuthenticateData($registrations);
-        return array($request, $signs);
+        list($appId, $challenge, $registeredKeys) = $this->getAuthenticateData($registrations);
+        $request = new RegisterRequest($challenge, $appId);
+        return array($appId, $request, $registeredKeys);
     }
 
     /**
@@ -160,7 +162,6 @@ class U2F
             throw new Error('Registration challenge does not match', ERR_UNMATCHED_CHALLENGE );
         }
 
-        $registration = new Registration();
         $offs = 1;
         $pubKey = substr($rawReg, $offs, PUBKEY_LEN);
         $offs += PUBKEY_LEN;
@@ -169,11 +170,14 @@ class U2F
         if($tmpKey === null) {
             throw new Error('Decoding of public key failed', ERR_PUBKEY_DECODE );
         }
-        $registration->publicKey = base64_encode($pubKey);
+
         $khLen = $regData[$offs++];
         $kh = substr($rawReg, $offs, $khLen);
         $offs += $khLen;
-        $registration->keyHandle = $this->base64u_encode($kh);
+
+		$keyHandle = $this->base64u_encode($kh);
+		$publicKey = base64_encode($pubKey);
+        $registration = new Registration($keyHandle, $publicKey);
 
         // length of certificate is stored in byte 3 and 4 (excluding the first 4 bytes)
         $certLen = 4;
@@ -215,32 +219,32 @@ class U2F
     /**
      * Called to get an authentication request.
      *
+     * Returnss parameters for sign function in Javascript like as request in
+     * https://fidoalliance.org/specs/fido-u2f-v1.0-nfc-bt-amendment-20150514/fido-u2f-javascript-api.html#high-level-javascript-api
      * @param array $registrations An array of the registrations to create authentication requests for.
-     * @return array An array of SignRequest
+     * @return
+     *     string An application id for the request
+     *     string The websafe-base64-encoded challenge
+     *     array Identifiers for already registered tokens
      * @throws Error
      */
-    public function getAuthenticateData(array $registrations)
-    {
+    public function getAuthenticateData(array $registrations=array()) {
         $sigs = array();
-        $challenge = $this->createChallenge();
         foreach ($registrations as $reg) {
             if( !is_object( $reg ) ) {
                 throw new \InvalidArgumentException('$registrations of getAuthenticateData() method only accepts array of object.');
             }
 
-            $sig = new SignRequest();
-            $sig->appId = $this->appId;
-            $sig->keyHandle = $reg->keyHandle;
-            $sig->challenge = $challenge;
-            $sigs[] = $sig;
+            $sigs[] = new SignRequest($this->appId, $reg->keyHandle);
         }
-        return $sigs;
+        $challenge = $this->createChallenge();
+        return array($this->appId, $challenge, $sigs);
     }
 
     /**
      * Called to verify an authentication response
      *
-     * @param array $requests An array of outstanding authentication requests
+     * @param string The websafe-base64-encoded challenge created by self::getAuthenticateData()
      * @param array $registrations An array of current registrations
      * @param object $response A response from the authenticator
      * @return Registration
@@ -251,7 +255,8 @@ class U2F
      * If the Error returned is ERR_COUNTER_TOO_LOW this is an indication of
      * token cloning or similar and appropriate action should be taken.
      */
-    public function doAuthenticate(array $requests, array $registrations, $response)
+    // public function doAuthenticate(array $requests, array $registrations, $response)
+    public function doAuthenticate($challenge, array $registrations, $response)
     {
         if( !is_object( $response ) ) {
             throw new \InvalidArgumentException('$response of doAuthenticate() method only accepts object.');
@@ -261,28 +266,15 @@ class U2F
             throw new Error('User-agent returned error. Error code: ' . $response->errorCode, ERR_BAD_UA_RETURNING );
         }
 
-        /** @var object|null $req */
-        $req = null;
-
         /** @var object|null $reg */
         $reg = null;
 
         $clientData = $this->base64u_decode($response->clientData);
         $decodedClient = json_decode($clientData);
-        foreach ($requests as $req) {
-            if( !is_object( $req ) ) {
-                throw new \InvalidArgumentException('$requests of doAuthenticate() method only accepts array of object.');
-            }
-
-            if($req->keyHandle === $response->keyHandle && $req->challenge === $decodedClient->challenge) {
-                break;
-            }
-
-            $req = null;
-        }
-        if($req === null) {
+        if($challenge !== $decodedClient->challenge) {
             throw new Error('No matching request found', ERR_NO_MATCHING_REQUEST );
         }
+
         foreach ($registrations as $reg) {
             if( !is_object( $reg ) ) {
                 throw new \InvalidArgumentException('$registrations of doAuthenticate() method only accepts array of object.');
@@ -302,7 +294,8 @@ class U2F
         }
 
         $signData = $this->base64u_decode($response->signatureData);
-        $dataToVerify  = hash('sha256', $req->appId, true);
+        // $dataToVerify  = hash('sha256', $req->appId, true);
+        $dataToVerify  = hash('sha256', $this->appId, true);
         $dataToVerify .= substr($signData, 0, 5);
         $dataToVerify .= hash('sha256', $clientData, true);
         $signature = substr($signData, 5);
@@ -459,13 +452,18 @@ class SignRequest
     public $version = U2F_VERSION;
 
     /** Authentication challenge */
-    public $challenge;
+    // public $challenge;
 
     /** Key handle of a registered authenticator */
     public $keyHandle;
 
     /** Application id */
     public $appId;
+
+    public function __construct($appId, $keyHandle) {
+		$this->appId = $appId;
+		$this->keyHandle = $keyHandle;
+	}
 }
 
 /**
@@ -485,7 +483,14 @@ class Registration
     public $certificate;
 
     /** The counter associated with this registration */
-    public $counter = -1;
+    public $counter;
+
+    public function __construct($keyHandle, $publicKey) {
+		$this->keyHandle = $keyHandle;
+		$this->publicKey = $publicKey;
+		$this->certificate = '';
+		$this->counter = -1;
+	}
 }
 
 /**
